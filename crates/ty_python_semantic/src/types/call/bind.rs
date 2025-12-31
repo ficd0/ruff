@@ -49,7 +49,8 @@ use crate::types::{
     FieldInstance, FunctionalClassLiteral, FunctionalNamedTupleLiteral, KnownBoundMethodType,
     KnownClass, KnownInstanceType, MemberLookupPolicy, NominalInstanceType, PropertyInstanceType,
     SpecialFormType, StmtClassLiteral, TrackedConstraintSet, TypeAliasType, TypeContext,
-    TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind, enums, list_members, todo_type,
+    TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind, enums, list_members,
+    todo_type,
 };
 use crate::unpack::EvaluationMode;
 use crate::{DisplaySettings, Program};
@@ -339,6 +340,7 @@ impl<'db> Bindings<'db> {
 
     /// Evaluates the return type of certain known callables, where we have special-case logic to
     /// determine the return type in a way that isn't directly expressible in the type system.
+    #[allow(clippy::type_complexity)]
     fn evaluate_known_cases(
         &mut self,
         db: &'db dyn Db,
@@ -1175,8 +1177,8 @@ impl<'db> Bindings<'db> {
                         }
 
                         Some(KnownFunction::NamedTuple) => {
-                            // Handle collections.namedtuple(name, fields, ...)
-                            // namedtuple("Point", ["x", "y"]) or namedtuple("Point", "x y")
+                            // Handle `collections.namedtuple(name, fields, ...)`, e.g.,
+                            // `namedtuple("Point", ["x", "y"])` or `namedtuple("Point", "x y")`.
                             if let [Some(name_type), Some(fields_type), ..] =
                                 overload.parameter_types()
                             {
@@ -1184,7 +1186,7 @@ impl<'db> Bindings<'db> {
                                     .as_string_literal()
                                     .map(|s| Name::new(s.value(db)));
 
-                                // Try to extract field names from a tuple/list of strings.
+                                // Try to extract field names from a tuple or list of strings.
                                 let field_names: Option<Vec<Name>> = fields_type
                                     .exact_tuple_instance_spec(db)
                                     .and_then(|tuple_spec| {
@@ -1198,7 +1200,7 @@ impl<'db> Bindings<'db> {
                                             .collect::<Option<Vec<_>>>()
                                     })
                                     .or_else(|| {
-                                        // Try a single string like "x y" or "x, y".
+                                        // Split a single string like "x y" or "x, y".
                                         fields_type.as_string_literal().map(|s| {
                                             s.value(db)
                                                 .replace(',', " ")
@@ -1208,7 +1210,9 @@ impl<'db> Bindings<'db> {
                                         })
                                     });
 
-                                // Extract the defaults parameter (a tuple/list of default values).
+                                // Extract the defaults parameter (a tuple or list of default
+                                // values).
+                                //
                                 // Defaults apply to the rightmost fields.
                                 let defaults: Vec<Type<'db>> = overload
                                     .parameter_type_by_name("defaults", false)
@@ -1217,14 +1221,14 @@ impl<'db> Bindings<'db> {
                                     .and_then(|defaults_type| {
                                         defaults_type.exact_tuple_instance_spec(db).map(
                                             |tuple_spec| {
-                                                tuple_spec.fixed_elements().cloned().collect()
+                                                tuple_spec.fixed_elements().copied().collect()
                                             },
                                         )
                                     })
                                     .unwrap_or_default();
 
                                 if let (Some(name), Some(field_names)) = (name, field_names) {
-                                    // All field types are Any for collections.namedtuple.
+                                    // All field types are `Any` for `collections.namedtuple`.
                                     let any_type = Type::any();
                                     let num_fields = field_names.len();
                                     let num_defaults = defaults.len();
@@ -1245,7 +1249,9 @@ impl<'db> Bindings<'db> {
 
                                     let namedtuple =
                                         FunctionalNamedTupleLiteral::new(db, name, fields);
-                                    overload.set_return_type(SubclassOfType::from(db, namedtuple));
+                                    overload.set_return_type(Type::ClassLiteral(
+                                        ClassLiteral::FunctionalNamedTuple(namedtuple),
+                                    ));
                                 }
                             }
                         }
@@ -1534,7 +1540,7 @@ impl<'db> Bindings<'db> {
                     }
 
                     Type::SpecialForm(SpecialFormType::NamedTuple) => {
-                        // Handle typing.NamedTuple("Name", [("field", type), ...])
+                        // Handle `typing.NamedTuple("Name", [("field", type), ...])`.
                         if let [Some(name_type), Some(fields_type), ..] = overload.parameter_types()
                         {
                             let name = name_type
@@ -1542,7 +1548,8 @@ impl<'db> Bindings<'db> {
                                 .map(|s| Name::new(s.value(db)));
 
                             // Helper to extract (name, type) from a tuple element.
-                            // The functional form of typing.NamedTuple doesn't support defaults.
+
+                            // The functional form of `typing.NamedTuple` doesn't support defaults.
                             let extract_field = |field_tuple: &Type<'db>| -> Option<(
                                 Name,
                                 Type<'db>,
@@ -1587,7 +1594,8 @@ impl<'db> Bindings<'db> {
                                     })
                                     .or_else(|| {
                                         // Try to extract from a list type.
-                                        // For list[T], get T and check if it's a union of tuples.
+                                        // For `list[T]`, get `T` and check if it's a union of
+                                        // tuples.
                                         if let Type::NominalInstance(instance) = fields_type {
                                             let class = instance.class(db);
                                             if let ClassType::Generic(alias) = class {
@@ -1615,8 +1623,18 @@ impl<'db> Bindings<'db> {
 
                             if let (Some(name), Some(fields)) = (name, fields) {
                                 let namedtuple = FunctionalNamedTupleLiteral::new(db, name, fields);
-                                overload.set_return_type(SubclassOfType::from(db, namedtuple));
+                                overload.set_return_type(Type::ClassLiteral(
+                                    ClassLiteral::FunctionalNamedTuple(namedtuple),
+                                ));
+                            } else {
+                                overload.set_return_type(
+                                    KnownClass::NamedTupleFallback.to_class_literal(db),
+                                );
                             }
+                        } else {
+                            overload.set_return_type(
+                                KnownClass::NamedTupleFallback.to_class_literal(db),
+                            );
                         }
                     }
 
