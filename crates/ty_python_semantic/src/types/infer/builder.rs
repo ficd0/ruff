@@ -53,8 +53,8 @@ use crate::subscript::{PyIndex, PySlice};
 use crate::types::call::bind::{CallableDescription, MatchingOverloadIndex};
 use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
 use crate::types::class::{
-    ClassLiteral, CodeGeneratorKind, FieldKind, FunctionalNamedTupleLiteral, MetaclassErrorKind,
-    MethodDecorator,
+    ClassLiteral, CodeGeneratorKind, FieldKind, FunctionalNamedTupleLiteral,
+    FunctionalTypedDictLiteral, MetaclassErrorKind, MethodDecorator,
 };
 use crate::types::context::{InNoTypeCheck, InferContext};
 use crate::types::cyclic::CycleDetector;
@@ -5256,17 +5256,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             self.infer_newtype_expression(target, call_expr, definition)
                         }
                         Some(_) | None => {
-                            // Check for special forms like typing.NamedTuple.
+                            // Check for special forms like typing.NamedTuple and typing.TypedDict.
                             if let Some(SpecialFormType::NamedTuple) =
                                 callable_type.as_special_form()
                             {
-                                self.infer_functional_namedtuple_expression(call_expr)
+                                self.infer_functional_namedtuple_expression(
+                                    call_expr,
+                                    callable_type,
+                                )
+                            } else if let Some(SpecialFormType::TypedDict) =
+                                callable_type.as_special_form()
+                            {
+                                self.infer_functional_typeddict_expression(call_expr, callable_type)
                             } else if callable_type
                                 .as_function_literal()
                                 .is_some_and(|f| f.is_known(self.db(), KnownFunction::NamedTuple))
                             {
                                 // Handle collections.namedtuple.
-                                self.infer_collections_namedtuple_expression(call_expr)
+                                self.infer_collections_namedtuple_expression(
+                                    call_expr,
+                                    callable_type,
+                                )
                             } else {
                                 self.infer_call_expression_impl(call_expr, callable_type, tcx)
                             }
@@ -5802,14 +5812,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     /// Infer the type for a functional NamedTuple creation:
     /// `NamedTuple("Name", [("field", type), ...])`
-    fn infer_functional_namedtuple_expression(&mut self, call_expr: &ast::ExprCall) -> Type<'db> {
+    fn infer_functional_namedtuple_expression(
+        &mut self,
+        call_expr: &ast::ExprCall,
+        callable_type: Type<'db>,
+    ) -> Type<'db> {
         let db = self.db();
         let arguments = &call_expr.arguments;
 
         // We need at least 2 arguments: the name and the fields.
         if arguments.args.len() < 2 {
             // Fall back to normal call inference.
-            let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
             return self.infer_call_expression_impl(
                 call_expr,
                 callable_type,
@@ -5821,7 +5834,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let name_expr = &arguments.args[0];
         let name_ty = self.infer_expression(name_expr, TypeContext::default());
         let Some(name_lit) = name_ty.as_string_literal() else {
-            let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
             return self.infer_call_expression_impl(
                 call_expr,
                 callable_type,
@@ -5834,7 +5846,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let fields_expr = &arguments.args[1];
         let ast::Expr::List(list_expr) = fields_expr else {
             // If not a list literal, fall back to normal call inference.
-            let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
             return self.infer_call_expression_impl(
                 call_expr,
                 callable_type,
@@ -5848,7 +5859,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for elt in &list_expr.elts {
             // Each element should be a tuple like ("field_name", type).
             let ast::Expr::Tuple(tuple_expr) = elt else {
-                let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
                 return self.infer_call_expression_impl(
                     call_expr,
                     callable_type,
@@ -5857,7 +5867,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             };
 
             if tuple_expr.elts.len() != 2 {
-                let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
                 return self.infer_call_expression_impl(
                     call_expr,
                     callable_type,
@@ -5869,7 +5878,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let field_name_expr = &tuple_expr.elts[0];
             let field_name_ty = self.infer_expression(field_name_expr, TypeContext::default());
             let Some(field_name_lit) = field_name_ty.as_string_literal() else {
-                let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
                 return self.infer_call_expression_impl(
                     call_expr,
                     callable_type,
@@ -5888,19 +5896,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Create the functional namedtuple type.
         let namedtuple = FunctionalNamedTupleLiteral::new(db, name, fields.into_boxed_slice());
-        SubclassOfType::from(db, namedtuple)
+        Type::ClassLiteral(ClassLiteral::FunctionalNamedTuple(namedtuple))
     }
 
     /// Infer the type for a `collections.namedtuple` creation:
     /// `namedtuple("Name", ["field1", "field2"])` or `namedtuple("Name", "field1 field2")`.
-    fn infer_collections_namedtuple_expression(&mut self, call_expr: &ast::ExprCall) -> Type<'db> {
+    fn infer_collections_namedtuple_expression(
+        &mut self,
+        call_expr: &ast::ExprCall,
+        callable_type: Type<'db>,
+    ) -> Type<'db> {
         let db = self.db();
         let arguments = &call_expr.arguments;
 
         // We need at least 2 arguments: the name and the fields.
         if arguments.args.len() < 2 {
             // Fall back to normal call inference.
-            let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
             return self.infer_call_expression_impl(
                 call_expr,
                 callable_type,
@@ -5912,7 +5923,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let name_expr = &arguments.args[0];
         let name_ty = self.infer_expression(name_expr, TypeContext::default());
         let Some(name_lit) = name_ty.as_string_literal() else {
-            let callable_type = self.infer_expression(&call_expr.func, TypeContext::default());
             return self.infer_call_expression_impl(
                 call_expr,
                 callable_type,
@@ -5930,8 +5940,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 for elt in &list_expr.elts {
                     let field_ty = self.infer_expression(elt, TypeContext::default());
                     let Some(field_lit) = field_ty.as_string_literal() else {
-                        let callable_type =
-                            self.infer_expression(&call_expr.func, TypeContext::default());
                         return self.infer_call_expression_impl(
                             call_expr,
                             callable_type,
@@ -5948,8 +5956,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 for elt in &tuple_expr.elts {
                     let field_ty = self.infer_expression(elt, TypeContext::default());
                     let Some(field_lit) = field_ty.as_string_literal() else {
-                        let callable_type =
-                            self.infer_expression(&call_expr.func, TypeContext::default());
                         return self.infer_call_expression_impl(
                             call_expr,
                             callable_type,
@@ -5964,8 +5970,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => {
                 let fields_ty = self.infer_expression(fields_expr, TypeContext::default());
                 let Some(fields_lit) = fields_ty.as_string_literal() else {
-                    let callable_type =
-                        self.infer_expression(&call_expr.func, TypeContext::default());
                     return self.infer_call_expression_impl(
                         call_expr,
                         callable_type,
@@ -6020,7 +6024,112 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Create the functional namedtuple type.
         let namedtuple = FunctionalNamedTupleLiteral::new(db, name, fields);
-        SubclassOfType::from(db, namedtuple)
+        Type::ClassLiteral(ClassLiteral::FunctionalNamedTuple(namedtuple))
+    }
+
+    /// Infer the type for a functional TypedDict creation:
+    /// `TypedDict("Name", {"key": Type, ...})` or `TypedDict("Name", {"key": Type, ...}, total=False)`
+    fn infer_functional_typeddict_expression(
+        &mut self,
+        call_expr: &ast::ExprCall,
+        callable_type: Type<'db>,
+    ) -> Type<'db> {
+        let db = self.db();
+        let arguments = &call_expr.arguments;
+
+        // We need at least 2 arguments: the name and the fields dict.
+        if arguments.args.len() < 2 {
+            // Fall back to normal call inference.
+            return self.infer_call_expression_impl(
+                call_expr,
+                callable_type,
+                TypeContext::default(),
+            );
+        }
+
+        // Get the name (first argument must be a string literal).
+        let name_expr = &arguments.args[0];
+        let name_ty = self.infer_expression(name_expr, TypeContext::default());
+        let Some(name_lit) = name_ty.as_string_literal() else {
+            return self.infer_call_expression_impl(
+                call_expr,
+                callable_type,
+                TypeContext::default(),
+            );
+        };
+        let name = ast::name::Name::new(name_lit.value(db));
+
+        // Check for the `total` keyword argument (defaults to True).
+        let total = arguments
+            .find_keyword("total")
+            .map(|kw| {
+                matches!(
+                    &kw.value,
+                    ast::Expr::BooleanLiteral(ast::ExprBooleanLiteral { value: true, .. })
+                )
+            })
+            .unwrap_or(true);
+
+        // Get the fields (second argument must be a dict literal).
+        let fields_expr = &arguments.args[1];
+        let ast::Expr::Dict(dict_expr) = fields_expr else {
+            // If not a dict literal, fall back to normal call inference.
+            return self.infer_call_expression_impl(
+                call_expr,
+                callable_type,
+                TypeContext::default(),
+            );
+        };
+
+        // Extract fields from the dict literal.
+        let mut fields: Vec<(ast::name::Name, Type<'db>, bool)> =
+            Vec::with_capacity(dict_expr.items.len());
+
+        for item in &dict_expr.items {
+            // Each key should be a string literal.
+            let Some(key_expr) = &item.key else {
+                // Spread/unpacking not supported in functional TypedDict.
+                return self.infer_call_expression_impl(
+                    call_expr,
+                    callable_type,
+                    TypeContext::default(),
+                );
+            };
+
+            let key_ty = self.infer_expression(key_expr, TypeContext::default());
+            let Some(key_lit) = key_ty.as_string_literal() else {
+                return self.infer_call_expression_impl(
+                    call_expr,
+                    callable_type,
+                    TypeContext::default(),
+                );
+            };
+            let field_name = ast::name::Name::new(key_lit.value(db));
+
+            // Get the field type using annotation expression inference to capture qualifiers.
+            let field_type_and_qualifiers =
+                self.infer_annotation_expression(&item.value, DeferredExpressionState::None);
+            let field_type_ty = field_type_and_qualifiers.inner_type();
+            let qualifiers = field_type_and_qualifiers.qualifiers();
+
+            // Determine if the field is required based on `total` and any Required/NotRequired wrappers.
+            // - Required[T] makes the field required regardless of `total`
+            // - NotRequired[T] makes the field optional regardless of `total`
+            // - Without either, the field follows the `total` setting
+            let is_required = if qualifiers.contains(TypeQualifiers::REQUIRED) {
+                true
+            } else if qualifiers.contains(TypeQualifiers::NOT_REQUIRED) {
+                false
+            } else {
+                total
+            };
+
+            fields.push((field_name, field_type_ty, is_required));
+        }
+
+        // Create the functional TypedDict type.
+        let typeddict = FunctionalTypedDictLiteral::new(db, name, fields.into_boxed_slice());
+        Type::ClassLiteral(ClassLiteral::FunctionalTypedDict(typeddict))
     }
 
     fn infer_assignment_deferred(&mut self, value: &ast::Expr) {
@@ -8855,7 +8964,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Handle special forms like typing.NamedTuple.
         if let Some(SpecialFormType::NamedTuple) = callable_type.as_special_form() {
-            return self.infer_functional_namedtuple_expression(call_expression);
+            return self.infer_functional_namedtuple_expression(call_expression, callable_type);
+        }
+
+        // Handle typing.TypedDict functional form.
+        if let Some(SpecialFormType::TypedDict) = callable_type.as_special_form() {
+            return self.infer_functional_typeddict_expression(call_expression, callable_type);
         }
 
         // Handle collections.namedtuple.
@@ -8863,7 +8977,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .as_function_literal()
             .is_some_and(|f| f.is_known(self.db(), KnownFunction::NamedTuple))
         {
-            return self.infer_collections_namedtuple_expression(call_expression);
+            return self.infer_collections_namedtuple_expression(call_expression, callable_type);
         }
 
         self.infer_call_expression_impl(call_expression, callable_type, tcx)
@@ -9042,29 +9156,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // the `try_call` path below.
             // TODO: it should be possible to move these special cases into the `try_call_constructor`
             // path instead, or even remove some entirely once we support overloads fully.
-            let has_special_cased_constructor = matches!(
-                class.known(self.db()),
-                Some(
-                    KnownClass::Bool
-                        | KnownClass::Str
-                        | KnownClass::Type
-                        | KnownClass::Object
-                        | KnownClass::Property
-                        | KnownClass::Super
-                        | KnownClass::TypeAliasType
-                        | KnownClass::Deprecated
-                )
-            ) || (
-                // Constructor calls to `tuple` and subclasses of `tuple` are handled in `Type::Bindings`,
-                // but constructor calls to `tuple[int]`, `tuple[int, ...]`, `tuple[int, *tuple[str, ...]]` (etc.)
-                // are handled by the default constructor-call logic (we synthesize a `__new__` method for them
-                // in `ClassType::own_class_member()`).
-                class.is_known(self.db(), KnownClass::Tuple) && !class.is_generic()
-            ) || class
-                .stmt_class_literal(self.db())
-                .is_some_and(|(class_literal, specialization)| {
-                    CodeGeneratorKind::TypedDict.matches(self.db(), class_literal, specialization)
-                });
+            let has_special_cased_constructor =
+                matches!(
+                    class.known(self.db()),
+                    Some(
+                        KnownClass::Bool
+                            | KnownClass::Str
+                            | KnownClass::Type
+                            | KnownClass::Object
+                            | KnownClass::Property
+                            | KnownClass::Super
+                            | KnownClass::TypeAliasType
+                            | KnownClass::Deprecated
+                    )
+                ) || (
+                    // Constructor calls to `tuple` and subclasses of `tuple` are handled in `Type::Bindings`,
+                    // but constructor calls to `tuple[int]`, `tuple[int, ...]`, `tuple[int, *tuple[str, ...]]` (etc.)
+                    // are handled by the default constructor-call logic (we synthesize a `__new__` method for them
+                    // in `ClassType::own_class_member()`).
+                    class.is_known(self.db(), KnownClass::Tuple) && !class.is_generic()
+                ) || class.class_literal(self.db()).is_typed_dict(self.db());
 
             // temporary special-casing for all subclasses of `enum.Enum`
             // until we support the functional syntax for creating enum classes

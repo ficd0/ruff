@@ -6458,6 +6458,31 @@ impl<'db> Type<'db> {
                     .into()
                 }
 
+                // Functional namedtuple: create a signature with the field types as parameters.
+                None if class.as_functional_namedtuple().is_some() => {
+                    let namedtuple = class.as_functional_namedtuple().unwrap();
+                    let parameters: Vec<_> = namedtuple
+                        .fields(db)
+                        .iter()
+                        .map(|(name, ty, default_ty)| {
+                            let mut param = Parameter::positional_or_keyword(name.clone())
+                                .with_annotated_type(*ty);
+                            if let Some(default) = default_ty {
+                                param = param.with_default_type(*default);
+                            }
+                            param
+                        })
+                        .collect();
+                    Binding::single(
+                        self,
+                        Signature::new(
+                            Parameters::new(db, parameters),
+                            Some(namedtuple.to_instance(db)),
+                        ),
+                    )
+                    .into()
+                }
+
                 // Most class literal constructor calls are handled by `try_call_constructor` and
                 // not via getting the signature here. This signature can still be used in some
                 // cases (e.g. evaluating callable subtyping). TODO improve this definition

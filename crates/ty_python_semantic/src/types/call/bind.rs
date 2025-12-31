@@ -49,7 +49,7 @@ use crate::types::{
     FieldInstance, FunctionalClassLiteral, FunctionalNamedTupleLiteral, KnownBoundMethodType,
     KnownClass, KnownInstanceType, MemberLookupPolicy, NominalInstanceType, PropertyInstanceType,
     SpecialFormType, StmtClassLiteral, TrackedConstraintSet, TypeAliasType, TypeContext,
-    TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind, enums, list_members, todo_type,
+    TypeVarVariance, UnionBuilder, UnionType, WrapperDescriptorKind, enums, list_members,
 };
 use crate::unpack::EvaluationMode;
 use crate::{DisplaySettings, Program};
@@ -1245,7 +1245,9 @@ impl<'db> Bindings<'db> {
 
                                     let namedtuple =
                                         FunctionalNamedTupleLiteral::new(db, name, fields);
-                                    overload.set_return_type(SubclassOfType::from(db, namedtuple));
+                                    overload.set_return_type(Type::ClassLiteral(
+                                        ClassLiteral::FunctionalNamedTuple(namedtuple),
+                                    ));
                                 }
                             }
                         }
@@ -1530,7 +1532,9 @@ impl<'db> Bindings<'db> {
                     },
 
                     Type::SpecialForm(SpecialFormType::TypedDict) => {
-                        overload.set_return_type(todo_type!("Support for functional `TypedDict`"));
+                        // TypedDict functional form is handled in builder.rs via
+                        // infer_functional_typeddict_expression. This path is a fallback
+                        // and we just leave the return type unset to fall through.
                     }
 
                     Type::SpecialForm(SpecialFormType::NamedTuple) => {
@@ -1615,7 +1619,9 @@ impl<'db> Bindings<'db> {
 
                             if let (Some(name), Some(fields)) = (name, fields) {
                                 let namedtuple = FunctionalNamedTupleLiteral::new(db, name, fields);
-                                overload.set_return_type(SubclassOfType::from(db, namedtuple));
+                                overload.set_return_type(Type::ClassLiteral(
+                                    ClassLiteral::FunctionalNamedTuple(namedtuple),
+                                ));
                             }
                         }
                     }
